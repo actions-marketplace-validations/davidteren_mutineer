@@ -27,7 +27,7 @@ jobs:
     name: open a release PR if one is due
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0 # full history + tags for git describe/log
       - uses: ruby/setup-ruby@0dafeac902942906541bc140009cdbf32665b601 # v1
