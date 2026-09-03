@@ -4,19 +4,23 @@ require "json"
 require "open3"
 
 module Mutineer
-  # Raised when the daemon cannot be booted (bad boot path, app error, or it dies on
-  # the handshake). The CLI maps it to a runtime error.
+  # Raised when the daemon cannot be booted or is gone for good: a bad boot path, an
+  # app error, a failed handshake, a spawn the OS refused, or MAX_RESTARTS crashes.
+  # It means "stop the run" — a backend that scored the remaining mutants against a
+  # dead daemon would report a score covering a fraction of the work. The CLI maps it
+  # to a runtime error (exit 1).
   class DaemonBootError < StandardError; end
 
-  # #26/#27 Phase 2a — the TOOL-side handle for the app-side daemon.
+  # Tool-side handle for the app-side daemon.
   #
-  # Spawns `daemon_server.rb` UNDER THE APP'S BUNDLE/RUBY (cleaned env so the gem's
-  # bundler context never leaks; the daemon file is loaded by absolute path with
-  # `-r`, which bypasses the app bundle that has no mutineer), completes the ready
-  # handshake, then ships per-mutant payloads and reads structured verdicts. If the
-  # daemon dies mid-run it respawns (bounded) and marks the in-flight mutant `error`
-  # rather than corrupting the run. Reuses the cleaned-env spawn + stderr-drain proven
-  # in the spike driver and the spawn discipline of ExternalBackend.
+  # Spawns `daemon_server.rb` UNDER THE APP'S BUNDLE/RUBY (cleaned env so the
+  # gem's bundler context never leaks; the daemon file is loaded by absolute path
+  # with `-r`, which bypasses the app bundle that has no mutineer), completes the
+  # ready handshake, then ships per-mutant payloads and reads structured verdicts.
+  # If the daemon dies mid-run it respawns (bounded) and marks the in-flight
+  # mutant `error` rather than corrupting the run. Reuses the cleaned-env spawn
+  # and stderr-drain proven in the spike driver and the spawn discipline of
+  # ExternalBackend.
   class DaemonClient
     # Absolute path to the daemon entry, loaded app-side by `-r` (bypasses the bundle).
     DAEMON_PATH = File.expand_path("daemon_server.rb", __dir__)
@@ -49,16 +53,22 @@ module Mutineer
 
     # Run one mutant: ship the payload + covering tests, return the verdict string.
     # On a daemon crash (EOF/dead pipe) respawn (bounded) and return `"error"` for
-    # this mutant — never a wrong verdict, never a wedged run.
+    # this mutant. Never a wrong verdict, never a wedged run.
     #
     # @param id [Integer] request id (echoed back for ordering safety).
     # @param payload [Hash] {"code" => mutated ruby, "source_file" => path}.
     # @param tests [Array<String>] covering test file paths.
     # @param timeout [Numeric] per-mutant wall-clock timeout (seconds).
     # @param worker [Integer] worker slot; the daemon routes the fork to
-    #   `<db>-<worker>` (#26 isolation). Defaults to 0 (serial in U5).
+    #   `<db>-<worker>` for isolation. Defaults to 0 (serial).
     # @return [String] one of survived/killed/error/timeout.
     def request(id:, payload:, tests:, timeout:, worker: 0)
+      # close_io nils the pipes, so a client whose respawn never completed would
+      # otherwise fail per-mutant forever (NoMethodError on nil) and let the backend
+      # score every remaining mutant against nothing. Deadness is a property of the
+      # client, not of whichever exception happened to escape.
+      raise DaemonBootError, "daemon is not running" if @stdin.nil?
+
       # A crash can surface on the WRITE (daemon died idle between requests →
       # Errno::EPIPE) as well as the read (EOF), so guard both: either way, respawn
       # for future mutants and score THIS one error (re-running a crash-causing
@@ -76,10 +86,11 @@ module Mutineer
       "error"
     end
 
-    # #26/U7: ask the daemon to build the coverage map app-side and return it.
-    # One-shot control message (no id). Returns `{"map"=>..., "failed_test_files"=>...}`
-    # (possibly with an `"error"`), or nil if the daemon vanished — the caller then
-    # falls back to running the full test set (no narrowing) rather than mis-scoring.
+    # Ask the daemon to build the coverage map app-side and return it. One-shot
+    # control message (no id). Returns `{"map"=>..., "failed_test_files"=>...}`
+    # (possibly with an `"error"`), or nil if the daemon vanished. The caller then
+    # falls back to running the full test set (no narrowing) rather than
+    # mis-scoring.
     #
     # @return [Hash, nil] the coverage payload, or nil on a dead pipe.
     def coverage
@@ -103,8 +114,8 @@ module Mutineer
 
     private
 
-    # Cleaned environment for the app bundle: strip the gem's bundler/Ruby context so
-    # `bundle exec` resolves the APP's Gemfile under the requested Ruby.
+    # Cleaned environment for the app bundle: strip the gem's bundler/Ruby context
+    # so `bundle exec` resolves the APP's Gemfile under the requested Ruby.
     def app_env
       env = ENV.to_h.reject { |k, _| k.start_with?("BUNDLE_", "RUBY", "GEM_") }
       env["BUNDLE_GEMFILE"] = @gemfile
@@ -118,25 +129,38 @@ module Mutineer
     # @return [void]
     # @raise [Mutineer::DaemonBootError] when the daemon fails to boot.
     def spawn_daemon
-      # Plain `bundle exec ruby` — NOT `rbenv exec`, which would break CI and any
-      # non-rbenv setup. When bundler/ruby are rbenv shims, the RBENV_VERSION carried
-      # in app_env still selects the app's Ruby; otherwise the active Ruby is used.
-      @stdin, @stdout, @stderr, @wait_thr = Open3.popen3(
-        app_env, "bundle", "exec", "ruby",
-        "-r", DAEMON_PATH, "-e", "Mutineer::DaemonServer.run", chdir: @app_root
-      )
-      # Drain daemon stderr to the tool's stderr so child/boot errors are visible.
-      # Tracked (not fire-and-forget) so close_io can reclaim it on quit/respawn; the
-      # rescue swallows the benign EBADF/IOError raised when close_io closes the pipe
-      # out from under an in-flight copy_stream.
-      @drain = Thread.new do # rubocop:disable ThreadSafety/NewThread
-        IO.copy_stream(@stderr, @errio)
-      rescue IOError, Errno::EBADF
-        nil
-      end
+      # Plain `bundle exec ruby`, NOT `rbenv exec`, which would break CI and any
+      # non-rbenv setup. When bundler/ruby are rbenv shims, the RBENV_VERSION
+      # carried in app_env still selects the app's Ruby; otherwise the active
+      # Ruby is used.
+      # Everything up to the handshake is terminal, not one mutant's problem: a spawn
+      # the OS refuses (EMFILE/ENOMEM under --jobs N, ENOENT when `bundle` does not
+      # resolve) and a daemon that dies before accepting the boot payload (EPIPE on
+      # the write) both leave a client that cannot recover. Raise the class that ends
+      # the run — a SystemCallError would reach the CLI as a usage error (exit 2).
+      ready =
+        begin
+          @stdin, @stdout, @stderr, @wait_thr = Open3.popen3(
+            app_env, "bundle", "exec", "ruby",
+            "-r", DAEMON_PATH, "-e", "Mutineer::DaemonServer.run", chdir: @app_root
+          )
+          # Drain daemon stderr to the tool's stderr so child/boot errors are visible.
+          # Tracked (not fire-and-forget) so close_io can reclaim it on quit/respawn;
+          # the rescue swallows the benign EBADF/IOError raised when close_io closes
+          # the pipe out from under an in-flight copy_stream.
+          @drain = Thread.new do # rubocop:disable ThreadSafety/NewThread
+            IO.copy_stream(@stderr, @errio)
+          rescue IOError, Errno::EBADF
+            nil
+          end
 
-      send_line(@boot)
-      ready = read_line
+          send_line(@boot)
+          read_line
+        rescue SystemCallError, IOError => e
+          close_io
+          raise DaemonBootError, "daemon could not be started: #{e.class}: #{e.message}"
+        end
+
       unless ready && ready["ready"]
         detail = ready && ready["error"] ? ready["error"] : "daemon exited before the handshake"
         close_io

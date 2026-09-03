@@ -7,19 +7,30 @@ require_relative "mutation"
 
 module Mutineer
   # Renders an AggregateResult: the summary block, mutation score, and per-file
-  # survivor diffs. Stream discipline (R14): the report goes to `out` (stdout),
+  # survivor diffs. Stream discipline: the report goes to `out` (stdout),
   # diagnostics/warnings go to `err` (stderr), so `mutineer ... > report.txt`
   # captures only the report.
   #
   # `source_map` is { file_path => raw source string }, used to extract the
   # containing source line for each survivor diff.
   class Reporter
+    # Share of attempted mutants that may produce no verdict before `--threshold`
+    # stops trusting the score. A handful of flaky mutants in a large run is noise;
+    # a mostly-broken run is not a score. Deliberately not a flag: no one has needed
+    # a different number yet.
+    BROKEN_SHARE_LIMIT = 0.10
+
+    # A share alone gives a small run no tolerance at all: on a `--since` PR that
+    # yields 8 mutants, one timeout is 12.5%. README recommends exactly that
+    # workflow, so one bad mutant never fails the gate on its own, at any size.
+    BROKEN_FLOOR = 1
+
     def initialize(aggregate, source_map)
       @agg = aggregate
       @source_map = source_map
     end
 
-    # Single entry point (R20/R21). Branches on `format` ("human" | "json") and
+    # Single entry point. Branches on `format` ("human" | "json" | "html") and
     # routes the rendered report to `output` (a file, with a stderr confirmation)
     # or to `out`. Diagnostics always go to `err`.
     def report(out: $stdout, err: $stderr, threshold: 0.0, format: "human", output: nil, baseline: nil)
@@ -41,6 +52,20 @@ module Mutineer
         err.puts "Report written to #{abs}"
       else
         out.print rendered
+      end
+
+      # Both ways a run can fail the gate on completeness, said here rather than in
+      # the human renderer: --format json is the documented CI path, and a run that
+      # exits 1 must say why on every format, not only the one a person reads.
+      return unless threshold&.positive?
+
+      if @agg.mutation_score.nil? && broken_nil_score?
+        err.puts "[mutineer] nothing could be scored (#{broken_counts_detail}), so the " \
+                 "--threshold gate fails. See no_verdict[] in --format json for the cause of each."
+      elsif broken_share_exceeded?
+        err.puts "[mutineer] #{no_verdict_ratio}: #{broken_counts_detail}. The score covers " \
+                 "only part of the run, so the --threshold gate fails. See no_verdict[] in " \
+                 "--format json for the cause of each."
       end
     end
 
@@ -85,15 +110,19 @@ module Mutineer
         return 0 # pure no_coverage / ignored / empty — gate skipped
       end
 
+      # A score computed over a small slice of what was attempted is not this
+      # suite's score. Without this, 90 errored mutants and 10 that ran (9 killed)
+      # reports 90% and exits 0, so CI cannot tell a complete run from a broken one.
+      return 1 if broken_share_exceeded?
+
       score >= threshold ? 0 : 1
     end
 
     private
 
-    # Canonical machine-readable schema (KTD7). survivors/no_coverage are sorted
-    # by (file, line, operator) so output is byte-stable regardless of --jobs
-    # worker finish order (R22).
-    # Renders the JSON report.
+    # Canonical machine-readable schema. survivors/no_coverage are sorted by
+    # (file, line, operator) so output is byte-stable regardless of --jobs
+    # worker finish order.
     #
     # @api private
     # @param baseline [Mutineer::Baseline::Delta, nil] baseline delta.
@@ -101,13 +130,13 @@ module Mutineer
     def json_report(baseline = nil)
       killed = @agg.killed_count
       survived = @agg.survived_count
-      # C8: null (not 0.0) on an empty denominator, matching the nil-vs-0.0
+      # null (not 0.0) on an empty denominator, matching the nil-vs-0.0
       # discipline in AggregateResult; and the SAME rounding as the human report
       # (one run must not yield two scores by --format).
       score = @agg.mutation_score
 
       doc = {
-        schema_version: "1.1",
+        schema_version: "1.2",
         summary: {
           total: @agg.total, killed: killed, survived: survived,
           no_coverage: @agg.no_coverage_count,
@@ -115,37 +144,54 @@ module Mutineer
           skipped_invalid: @agg.skipped_invalid_count,
           errored: @agg.errored_count, timeout: @agg.timeout_count,
           ignored: @agg.ignored_count,
+          # The gate is computed from these two, so a consumer never re-derives them.
+          attempted: attempted_count, no_verdict: no_verdict_count,
           score: score
         },
         survivors: @agg.surviving_mutants.map { |r| survivor_json(r) }
                        .sort_by { |h| [h[:file], h[:line], h[:operator]] },
         no_coverage: @agg.results.select(&:no_coverage?).map { |r| no_coverage_json(r) }
                          .sort_by { |h| [h[:file], h[:line]] },
-        # #9: same shape as no_coverage; additive key.
+        # Same shape as no_coverage; additive key.
         uncapturable: @agg.results.select(&:uncapturable?).map { |r| no_coverage_json(r) }
                           .sort_by { |h| [h[:file], h[:line]] },
-        # #10: equivalent mutants the user suppressed — emitted with their stable
-        # id so the user can audit what is silenced (and copy ids for survivors
-        # they want to add). Excluded from the score; never in `survivors`.
+        # Every mutant that was attempted and produced no verdict, whatever the
+        # reason — the set the --threshold completeness gate counts. Named for the
+        # condition rather than one status, because summary.errored means :error
+        # alone and a key that reconciled with neither would be worse. `details`
+        # carries the cause where there is one. Uncapturable mutants also appear in
+        # uncapturable[]; that key keeps its lean shape for existing consumers.
+        # to_s/to_i because a pre-fork failure has no subject, so its file and line
+        # are null and would not compare against a real entry. id and status extend
+        # the key to a total order: these entries collide on (file, line) far more
+        # than survivors do — several mutants on one crashy line, every pre-fork
+        # entry on ("", 0) — and sort_by is not stable, so equal keys would leave
+        # worker finish order in the output and break the byte-stability promise.
+        no_verdict: @agg.results.select { |r| r.error? || r.timeout? || r.uncapturable? }
+                        .map { |r| no_verdict_json(r) }
+                        .sort_by { |h| [h[:file].to_s, h[:line].to_i, h[:id].to_s, h[:status].to_s, h[:details].to_s] },
+        # Equivalent mutants the user suppressed: emitted with their stable id so
+        # the user can audit what is silenced (and copy ids for survivors they
+        # want to add). Excluded from the score; never in `survivors`.
         ignored: @agg.results.select(&:ignored?).map { |r| ignored_json(r) }
                      .sort_by { |h| [h[:file], h[:line], h[:operator]] },
-        # #11: per-source breakdown (additive; #13 consumes it). Sorted by file so
+        # Per-source breakdown (additive; baseline consumes it). Sorted by file so
         # output is byte-stable. Reuses AggregateResult via by_source.
         per_source: @agg.by_source.map { |file, agg| per_source_json(file, agg) }
                         .sort_by { |h| h[:file] }
       }
-      # #13: additive baseline-delta block, present only with --baseline. Existing
-      # consumers ignore the extra key; schema_version stays 1.1.
+      # Additive baseline-delta block, present only with --baseline. Existing
+      # consumers ignore the extra key; it does not move schema_version on its own.
       doc[:baseline] = baseline_json(baseline) if baseline
       "#{JSON.generate(doc)}\n"
     end
 
-    # #23: one self-contained HTML file (inline CSS, no external assets) — the
-    # overall score + summary counts, a per-source table, and every surviving
-    # mutant with its stable id and diff. All source/diff/identifier text is
-    # HTML-escaped (CGI.escapeHTML) so a `<`/`>` in source can never break the
-    # markup. Reuses survivor_json/per_source_json so one run yields one set of
-    # facts regardless of --format.
+    # One self-contained HTML file (inline CSS, no external assets): the overall
+    # score + summary counts, a per-source table, and every surviving mutant with
+    # its stable id and diff. All source/diff/identifier text is HTML-escaped
+    # (CGI.escapeHTML) so a `<`/`>` in source can never break the markup. Reuses
+    # survivor_json/per_source_json so one run yields one set of facts regardless
+    # of --format.
     def html_report
       score = @agg.mutation_score
       survivors = @agg.surviving_mutants.map { |r| survivor_json(r) }
@@ -251,9 +297,9 @@ module Mutineer
     # HTML-escapes any text destined for the document (stdlib CGI).
     def esc(text) = CGI.escapeHTML(text.to_s)
 
-    # #13: the same delta facts the human report prints, for dashboards. new_survivors
+    # The same delta facts the human report prints, for dashboards. new_survivors
     # reuse the ignored_json shape (subject/file/line/operator/token/id) and sort
-    # byte-stably so output doesn't depend on --jobs finish order.
+    # byte-stably so output does not depend on --jobs finish order.
     def baseline_json(delta)
       {
         regressed: delta.regressed,
@@ -300,7 +346,7 @@ module Mutineer
         file: file,
         line: start_line,
         operator: m.operator.to_s,
-        # #10: the stable, copy-pasteable id (next to the human-readable token) so a
+        # The stable, copy-pasteable id (next to the human-readable token) so a
         # user can paste it straight into .mutineer.yml `ignore:`.
         id: result.id,
         token: token,
@@ -308,7 +354,7 @@ module Mutineer
       }
     end
 
-    # An entry under the JSON `ignored:` key — what the user already suppressed.
+    # An entry under the JSON `ignored:` key: what the user already suppressed.
     def ignored_json(result)
       m = result.mutation
       file = result.subject.file
@@ -329,7 +375,7 @@ module Mutineer
     # mutation's 1-based start line, the full original line-block it touches, the
     # spliced mutated block, and a single-line token label for the header.
     def diff_for(m, source)
-      # Byte math (C1): Prism offsets are byte offsets; byteindex/byterindex/
+      # Byte math: Prism offsets are byte offsets; byteindex/byterindex/
       # byteslice keep line splicing correct for multibyte sources.
       line_begin = m.start_offset.zero? ? 0 : (source.byterindex("\n", m.start_offset - 1) || -1) + 1
       line_end   = source.byteindex("\n", m.end_offset) || source.bytesize
@@ -359,6 +405,31 @@ module Mutineer
       }
     end
 
+    # An entry under the JSON `no_verdict:` key: an attempted mutant with no verdict.
+    # A pre-fork failure has no subject or mutation attached, so those degrade to
+    # nulls rather than dropping the entry — the count must still reconcile with
+    # `summary.no_verdict`.
+    #
+    # @api private
+    # @param result [Mutineer::Result] an errored or timed-out result.
+    # @return [Hash] no-verdict JSON object.
+    def no_verdict_json(result)
+      file = result.subject&.file
+      line =
+        if result.mutation && file
+          source = @source_map[file] || File.read(file)
+          source.byteslice(0, result.mutation.start_offset).count("\n") + 1
+        end
+      {
+        subject: result.subject&.qualified_name,
+        file: file,
+        line: line,
+        id: result.id,
+        status: result.status.to_s,
+        details: result.details
+      }
+    end
+
     # Writes the summary block.
     #
     # @param out [IO] output stream.
@@ -370,9 +441,9 @@ module Mutineer
       out.puts format("Survived:     %-6d  No coverage:   %d", @agg.survived_count, @agg.no_coverage_count)
       out.puts format("Skipped:      %-6d  Errored:       %d", @agg.skipped_invalid_count,
                       @agg.errored_count + @agg.timeout_count)
-      # #9: a broken harness, not a coverage gap — report it distinctly from No coverage.
+      # A broken harness, not a coverage gap: report it distinctly from No coverage.
       out.puts format("Uncapturable: %-6d  (tests failed to run)", @agg.uncapturable_count)
-      # #10: equivalent mutants the user suppressed; excluded from the denominator.
+      # Equivalent mutants the user suppressed; excluded from the denominator.
       out.puts format("Ignored:      %-6d  (equivalent, suppressed)", @agg.ignored_count)
     end
 
@@ -389,10 +460,10 @@ module Mutineer
                  "#{@agg.ignored_count} ignored excluded"
       if score.nil?
         out.puts "Mutation score: N/A  (no covered mutants)"
-        if broken_nil_score?
-          err.puts "[mutineer] no covered mutations (#{broken_nil_score_detail}); " \
-                   "threshold gate fails under a positive --threshold (broken harness)."
-        else
+        # Only the benign case here: the gate-failure explanation is emitted once
+        # from {report}, for every format, so it cannot be said twice or only to
+        # the reader of the human report.
+        unless broken_nil_score?
           err.puts "[mutineer] no covered mutations; mutation score is N/A and the threshold check is skipped."
         end
       else
@@ -409,11 +480,58 @@ module Mutineer
         (@agg.errored_count + @agg.timeout_count + @agg.uncapturable_count).positive?
     end
 
-    # Human-readable counts for a broken nil-score run.
+    # Mutants that were attempted but produced no verdict, over everything
+    # attempted. Above the limit the score describes too small a slice of the run
+    # to gate on. A few flaky mutants in a large run stay under it.
+    #
+    # @api private
+    # @return [Boolean] true when too much of the run failed to produce a verdict.
+    def broken_share_exceeded?
+      attempted = attempted_count
+      attempted.positive? && no_verdict_count > BROKEN_FLOOR &&
+        no_verdict_count > attempted * BROKEN_SHARE_LIMIT
+    end
+
+    # Mutants that were attempted and produced no verdict, whatever the reason.
+    #
+    # @api private
+    # @return [Integer] errored + timed out + uncapturable.
+    def no_verdict_count
+      @agg.errored_count + @agg.timeout_count + @agg.uncapturable_count
+    end
+
+    # Mutants that were actually run. Deliberately not `total`: no_coverage,
+    # skipped-invalid and ignored mutants were never attempted, so counting them
+    # would dilute the share and let a broken run slip under the limit.
+    #
+    # skipped-invalid is excluded from both sides: it means a mutant did not
+    # re-parse and was correctly never run, which is a validity outcome rather
+    # than a broken harness. Cost: an overwhelmingly-skipped run still scores on
+    # what little ran; that is our operator misbehaving and wants its own signal.
+    #
+    # @api private
+    # @return [Integer] killed + survived + no-verdict.
+    def attempted_count
+      @agg.killed_count + @agg.survived_count + no_verdict_count
+    end
+
+    # The sentence both the verdict line and the stderr note are built from, so a
+    # user cannot read one number in the report and a different one beside it.
+    #
+    # @api private
+    # @return [String] e.g. "90 of 100 attempted mutants produced no verdict (90.0%, limit 10%)".
+    def no_verdict_ratio
+      pct = (no_verdict_count * 100.0 / attempted_count).round(1)
+      "#{no_verdict_count} of #{attempted_count} attempted mutants produced no verdict " \
+        "(#{pct}%, limit #{(BROKEN_SHARE_LIMIT * 100).round}%)"
+    end
+
+    # Human-readable counts of the states that produced no verdict. Used by both
+    # the nil-score message and the completeness gate, so they agree.
     #
     # @api private
     # @return [String]
-    def broken_nil_score_detail
+    def broken_counts_detail
       parts = []
       parts << "#{@agg.errored_count} errored" if @agg.errored_count.positive?
       parts << "#{@agg.timeout_count} timeout" if @agg.timeout_count.positive?
@@ -421,10 +539,9 @@ module Mutineer
       parts.join(", ")
     end
 
-    # #11: one line per source after the global summary, so a multi-source run
-    # shows which file is weak. Omitted for a single-source run — the global
-    # summary already says everything (ponytail: no redundant one-line block).
-    # Writes the per-source breakdown.
+    # One line per source after the global summary, so a multi-source run shows
+    # which file is weak. Omitted for a single-source run: the global summary
+    # already says everything (no redundant one-line block).
     #
     # @param out [IO] output stream.
     # @return [void]
@@ -443,7 +560,7 @@ module Mutineer
       end
     end
 
-    # #13: the --baseline delta, appended after the normal report. Names every NEW
+    # The --baseline delta, appended after the normal report. Names every NEW
     # survivor (subject (file:line) operator) and the score delta when it dropped,
     # then a one-line REGRESSION/OK verdict so CI logs show which gate fired.
     def baseline_section(out, delta)
@@ -507,13 +624,17 @@ module Mutineer
       score = @agg.mutation_score
       if score.nil?
         if broken_nil_score?
-          out.puts "FAILED: no covered mutants (#{broken_nil_score_detail}); " \
+          out.puts "FAILED: no covered mutants (#{broken_counts_detail}); " \
                    "threshold #{threshold}% cannot pass with a broken harness"
         end
         return
       end
 
-      if score >= threshold
+      # Same rule as exit_code, or the report says PASSED on a run that exits 1 —
+      # and with --output that wrong verdict is what gets archived.
+      if broken_share_exceeded?
+        out.puts "FAILED: #{no_verdict_ratio}; #{score}% covers only part of the run"
+      elsif score >= threshold
         out.puts "PASSED: #{score}% >= threshold #{threshold}%"
       else
         out.puts "FAILED: #{score}% < threshold #{threshold}%"

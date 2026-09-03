@@ -6,6 +6,80 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-07-29
+
+### Fixed
+- **`--threshold` now gates on the run being complete, not just its score** — a
+  score is `killed / (killed + survived)`, so mutants that error, time out or come
+  back uncapturable are excluded from the denominator: a broken harness *raised*
+  the score instead of lowering it. Ninety errored mutants and ten that ran (nine
+  killed) reported 90% and exited 0, so CI could not tell a complete run from a
+  mostly-broken one. Past 10% of attempted mutants producing no verdict, a positive
+  `--threshold` now exits 1 whatever the score, and the report says which states
+  broke, on every `--format`. A single bad mutant never trips it, however small the
+  run, so a `--since` PR with a handful of mutants keeps its flake tolerance (#78).
+
+### Added
+- **`no_verdict[]` in the JSON report** (`schema_version` 1.2) — every attempted
+  mutant that produced no verdict, with its `status` and, where there is one, the
+  `details` explaining the cause. `Result#details` was built and rendered in no
+  format at all, so a daemon crash reached the user as nothing but a larger errored
+  count. `summary` gains `attempted` and `no_verdict`, the two figures the
+  completeness gate is computed from (#78).
+
+## [0.11.3] - 2026-07-29
+
+### Fixed
+- **Nothing to mutate now costs nothing** — `--since` matching no changed line (a
+  docs-only PR, which README documents `--since origin/<base>` for) still did the
+  expensive part before discovering there was no work: `--daemon` booted the app
+  once for the coverage map and again for every `--jobs` worker, and
+  `--test-command` ran the whole suite for a smoke check that calibrates a timeout
+  no mutant would use. Both backends now return as soon as the job list is empty.
+  The in-process path is unchanged: it boots before collecting jobs, so it cannot
+  know the list is empty yet. One consequence worth stating: a zero-job `--daemon`
+  run no longer boots the app, so an app that fails to boot now exits 0 (nothing
+  to do) instead of exit 1 (#76).
+- **A dead daemon ends the run instead of scoring the rest against it** — a
+  daemon that dies while running one mutant was already handled: `DaemonClient`
+  respawns and answers `error` for that mutant. But a daemon that could not come
+  back was not. `restart!` closes the pipes before respawning, so if the respawn
+  failed at the OS level (`EMFILE` or `ENOMEM` under `--jobs N`, `ENOENT` when
+  `bundle` does not resolve) the client was left permanently dead while raising
+  errors that read as ordinary per-mutant failures. Every remaining mutant scored
+  `error` against nothing, and Mutineer printed a mutation score built on the
+  fraction of mutants that ran before the daemon died. `DaemonClient` now raises
+  `DaemonBootError` whenever it is gone for good — a refused spawn, a failed boot
+  handshake on respawn, closed pipes, or `MAX_RESTARTS` crashes — and the CLI
+  reports it as a message and exit 1 rather than a backtrace. Under `--jobs N`
+  the remaining queue is dropped so sibling workers stop too. Errored mutants
+  still cannot fail the `--threshold` gate once any mutant is scored (#78).
+
+### Changed
+- **Daemon orchestration split out of `Runner`** — the persistent-daemon backend
+  (job fan-out, worker DBs, coverage-map build, boot config, verdict mapping) now
+  lives in `Mutineer::DaemonBackend`. `Runner` keeps job collection, coverage
+  selection and the single in-process mutant run, and drops from 662 to 439 lines.
+  The external backend's orchestration stays on `Runner` for now, so the two
+  backends are not yet symmetrical. No CLI or behaviour change (#58).
+  Internal-only removals: `Runner.execute_daemon`, `Runner.daemon_coverage_map`
+  and `Runner::DAEMON_TIMEOUT` no longer exist. They were never documented —
+  the supported programmatic contract is the JSON report, the stable mutant ids
+  and the exit codes — so only code calling `Runner` internals directly is
+  affected.
+- **Comment diet on orchestration files** — present-tense YARD contracts; drop
+  ticket/phase/KTD history tags from runner, CLI, daemon pair, coverage map,
+  reporter, result, and related modules. Safety and score invariants kept (#57).
+
+## [0.11.2] - 2026-07-24
+
+### Fixed
+- **`--test-command` under version managers** — scrub Mutineer's rbenv/asdf
+  version bins and bundler/gem env from the child so the suite can resolve the
+  app's Ruby via shims / `.ruby-version`. Smoke check prints a targeted hint on
+  `Bundler::RubyVersionMismatch` instead of only blaming DB/migrations. Docs
+  cover a wrapper recipe for stubborn setups (#32).
+
 ## [0.11.1] - 2026-07-23
 
 ### Fixed
@@ -244,6 +318,9 @@ Rails hardening + CI batch (issues #8–#13), all verified Rails-free.
 - `.mutineer.yml` configuration (CLI > config > default precedence).
 - Byte-correct source handling for multibyte (UTF-8) sources.
 
+[0.11.4]: https://github.com/davidteren/mutineer/releases/tag/v0.11.4
+[0.11.3]: https://github.com/davidteren/mutineer/releases/tag/v0.11.3
+[0.11.2]: https://github.com/davidteren/mutineer/releases/tag/v0.11.2
 [0.11.1]: https://github.com/davidteren/mutineer/releases/tag/v0.11.1
 [0.11.0]: https://github.com/davidteren/mutineer/releases/tag/v0.11.0
 [0.10.0]: https://github.com/davidteren/mutineer/releases/tag/v0.10.0

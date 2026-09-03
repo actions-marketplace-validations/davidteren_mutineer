@@ -13,21 +13,21 @@ require_relative "worker_pool"
 require_relative "mutant_id"
 require_relative "file_swap"
 require_relative "external_backend"
-require_relative "daemon_client"
+require_relative "daemon_backend"
 require "set"
 
 module Mutineer
   # Orchestrates one mutation end-to-end: apply it textually, validate the
   # result, select its covering test files from the coverage map, then run only
-  # those against the mutated source in an isolated child process (strategy 7a —
+  # those against the mutated source in an isolated child process (strategy
   # whole-file reload via `load`).
   #
   # The source file path is passed explicitly because Mutation carries only byte
-  # offsets, not its file. M3 replaces M2's hardcoded `test_file:` with coverage-
-  # map selection: a mutation whose line no test exercises is :no_coverage (no
-  # fork); otherwise exactly the covering test files run in the child.
+  # offsets, not its file. Coverage-map selection replaces a hardcoded test file:
+  # a mutation whose line no test exercises is :no_coverage (no fork); otherwise
+  # exactly the covering test files run in the child.
   class Runner
-    # Full Phase B orchestration: resolve operators, discover subjects, build the
+    # Full orchestration: resolve operators, discover subjects, build the
     # coverage map, run every mutation, and aggregate. Returns
     # [AggregateResult, source_map]. The CLI then reports + applies the exit code;
     # the integration test asserts directly on the AggregateResult.
@@ -41,25 +41,25 @@ module Mutineer
     def self.execute(config)
       operator_classes = MutatorRegistry.resolve(config.operators || MutatorRegistry::DEFAULT_NAMES)
 
-      # #27: the external backend runs the suite as a subprocess in the app's own
-      # runtime — it does no in-process boot/require or coverage build, so branch
-      # before any of that. The in-process path below is untouched.
+      # External backend: run the suite as a subprocess in the app's own runtime.
+      # It does no in-process boot/require or coverage build, so branch before any
+      # of that. The in-process path below is untouched.
       return execute_external(config, operator_classes) if config.test_command
 
-      # #26/#27 Phase 2a: the daemon backend boots the app ONCE in a persistent
-      # subprocess under the app's bundle and forks per mutant. Tool-side we only
-      # discover jobs + build payloads (Prism), so branch before any in-process boot.
-      return execute_daemon(config, operator_classes) if config.daemon
+      # Daemon backend: boot the app ONCE in a persistent subprocess under the
+      # app's bundle and fork per mutant. Tool-side we only discover jobs + build
+      # payloads (Prism), so branch before any in-process boot.
+      return DaemonBackend.execute(config, operator_classes) if config.daemon
 
       # Boot mode: require the boot file ONCE so the app env (e.g. Rails) is booted
       # in the parent and inherited by every fork. Do NOT manually require the
-      # sources — under Zeitwerk a manual require of an autoloadable file raises;
+      # sources. Under Zeitwerk a manual require of an autoloadable file raises;
       # the booted env autoloads them, and subject discovery is a static Prism
       # parse that needs nothing loaded. Standalone mode requires the sources as
       # before so their classes exist for the children to inherit.
       if config.boot
-        # #7: under --rails an unset RAILS_ENV boots development, where the test
-        # suite isn't loaded — coverage comes back empty and EVERY mutant is
+        # Under --rails an unset RAILS_ENV boots development, where the test
+        # suite is not loaded. Coverage comes back empty and EVERY mutant is
         # falsely reported no_coverage (score N/A, exit 0). Default it to test.
         ensure_rails_env(config)
 
@@ -104,10 +104,11 @@ module Mutineer
 
       jobs = filter_since(jobs, source_map, config) if config.since
 
-      # C3: 7a writes mutineer_mutant*.rb into each source dir (so require_relative
-      # resolves). A SIGKILL'd child skips the tempfile's ensure-unlink, orphaning
-      # it. `ensure` is unreliable vs SIGKILL, so the PARENT sweeps each source dir
-      # before and after the run — orphans are impossible after a normal run.
+      # Whole-file reload writes mutineer_mutant*.rb into each source dir (so
+      # require_relative resolves). A SIGKILL'd child skips the tempfile's
+      # ensure-unlink, orphaning it. `ensure` is unreliable vs SIGKILL, so the
+      # PARENT sweeps each source dir before and after the run. Orphans are
+      # impossible after a normal run.
       dirs = source_dirs(config)
       sweep_orphans(dirs)
 
@@ -136,12 +137,12 @@ module Mutineer
     end
 
     # Collect every (subject, mutation, id) up front so a backend can run them.
-    # #10: a mutant the user marked known-equivalent (inline disable-line comment
-    # or .mutineer.yml ignore id) is classified :ignored here and NEVER run — it is
+    # A mutant the user marked known-equivalent (inline disable-line comment or
+    # .mutineer.yml ignore id) is classified :ignored here and NEVER run. It is
     # removed from the killed+survived denominator so a strong file reaches 100%.
     # The stable id is computed per subject (occurrence needs the full list) and
     # carried on every job so the parent can reattach it after the run. Shared by
-    # the in-process and external (#27) backends so job selection can never drift.
+    # the in-process, external, and daemon backends so job selection can never drift.
     #
     # @return [Array(Array, Array<Result>, Hash<String,String>)] jobs, ignored, source_map.
     def self.collect_jobs(config, operator_classes)
@@ -168,12 +169,12 @@ module Mutineer
       [jobs, ignored_results, source_map]
     end
 
-    # #27: external backend orchestration. Runs each mutant's whole-file mutation on
+    # External backend orchestration. Runs each mutant's whole-file mutation on
     # disk (crash-safe swap) and executes the user's --test-command as a subprocess
-    # in the app's own runtime. Serial by construction (KTD-5: one shared DB, no
-    # per-worker isolation yet). No coverage narrowing — every mutant runs the full
-    # --test set (KTD-6); the score is therefore an upper bound and not comparable
-    # to an in-process run (the CLI discloses this).
+    # in the app's own runtime. Serial by construction (one shared DB, no
+    # per-worker isolation yet). No coverage narrowing: every mutant runs the full
+    # --test set; the score is therefore an upper bound and not comparable to an
+    # in-process run (the CLI discloses this).
     #
     # @param config [Mutineer::Config] run configuration (test_command set).
     # @param operator_classes [Array<Class>] resolved operators.
@@ -182,7 +183,7 @@ module Mutineer
       abs_tests = config.tests.map { |t| File.expand_path(t, config.project_root) }
       dirs      = source_dirs(config)
 
-      # Heal any file a prior hard-killed run left mutated BEFORE reading source —
+      # Heal any file a prior hard-killed run left mutated BEFORE reading source.
       # collect_jobs computes mutation offsets/ids from the on-disk bytes, so a
       # still-mutated file would yield garbage offsets against the later-healed
       # source. Heal first, then discover jobs from the clean tree.
@@ -191,11 +192,15 @@ module Mutineer
       jobs, ignored_results, source_map = collect_jobs(config, operator_classes)
       jobs = filter_since(jobs, source_map, config) if config.since
 
+      # Nothing to mutate: return before the smoke check, which runs the whole
+      # --test set to calibrate a timeout no mutant would use (#76).
+      return [AggregateResult.new(ignored_results), source_map] if jobs.empty?
+
       # Calibrate the per-mutant timeout from the clean run (a real suite far
-      # outlasts the 10s in-process fork budget), and abort if it isn't green.
-      # ponytail: 3x the clean run, floor 30s, ceiling 300s — a heuristic. The
-      # floor covers a fast suite; the ceiling bounds a hung mutant (infinite loop)
-      # so a handful can't stall a serial run for ~45min on a slow suite.
+      # outlasts the 10s in-process fork budget), and abort if it is not green.
+      # 3x the clean run, floor 30s, ceiling 300s: a heuristic. The floor covers
+      # a fast suite; the ceiling bounds a hung mutant (infinite loop) so a
+      # handful cannot stall a serial run for ~45min on a slow suite.
       smoke_elapsed = ExternalBackend.smoke_check!(config.test_command, abs_tests)
       timeout = [[smoke_elapsed * 3, 30].max, 300].min.ceil
 
@@ -205,7 +210,7 @@ module Mutineer
           r = run_external(subject, mutation, config.test_command, abs_tests,
                            timeout: timeout, verbose: config.verbose)
           results << r.with(subject: subject, mutation: mutation, id: id)
-          break if config.fail_fast && r.survived? # #21: stop at the first survivor
+          break if config.fail_fast && r.survived? # stop at the first survivor
         end
       ensure
         FileSwap.restore_orphans(dirs)
@@ -214,11 +219,11 @@ module Mutineer
       [AggregateResult.new(results + ignored_results), source_map]
     end
 
-    # Runs one mutant through the external backend: apply the whole-file mutation on
-    # disk, run the command, restore. KTD-8: an invalid (non-reparsing) mutant would
+    # Runs one mutant through the external backend: apply the whole-file mutation
+    # on disk, run the command, restore. An invalid (non-reparsing) mutant would
     # fail to load and score a false `killed`, so skip it tool-side (Prism, already
-    # cheap) and never write the file — preserving the `skipped` verdict the
-    # in-process path gives at runner.rb's pre-fork check.
+    # cheap) and never write the file, preserving the `skipped` verdict the
+    # in-process path gives at the pre-fork check.
     #
     # @return [Mutineer::Result] verdict for this mutant.
     def self.run_external(subject, mutation, command, abs_tests, timeout:, verbose:)
@@ -231,185 +236,16 @@ module Mutineer
       end
     end
 
-    # Daemon backend: boot the app once in a persistent subprocess and fork per
-    # mutant. Tool-side we build the ready-to-`load` payload (whole-file reload by
-    # default) and ship it; the daemon needs no Prism/mutineer. Coverage is built
-    # once via a short-lived daemon so each mutant runs only its covering tests.
-    # When jobs > 1, each worker uses its own database (SQLite). Fail-fast forces
-    # serial so the survivor set matches jobs 1.
-    #
-    # @return [Array(Mutineer::AggregateResult, Hash<String,String>)] aggregate and source map.
-    def self.execute_daemon(config, operator_classes)
-      jobs, ignored_results, source_map = collect_jobs(config, operator_classes)
-      jobs = filter_since(jobs, source_map, config) if config.since
-      abs_tests = config.tests.map { |t| File.expand_path(t, config.project_root) }
-
-      # Build the coverage map once (app-side). nil when the build fails — runners
-      # fall back to the full --test set (and emit a stderr warning) rather than
-      # mis-scoring everything as no_coverage.
-      coverage_map = daemon_coverage_map(config, abs_tests)
-
-      # #26/U6: worker count = resolved --jobs, capped at the job count (no idle
-      # daemons). >1 → N concurrent daemon handles, each on its OWN worker DB (V6:
-      # N-handles, the spike-proven shape). 1 → the serial single-daemon path.
-      # --fail-fast forces serial: parallel's stop flag fires on the first survivor
-      # by WALL-CLOCK, not input index, so the verdict set would diverge from serial
-      # (a different, non-deterministic survivor set/score) — the "identical to
-      # --jobs 1" guarantee below only holds when fail-fast can't race.
-      worker_count = [config.jobs || 1, 1].max
-      worker_count = 1 if config.fail_fast
-      worker_count = [worker_count, jobs.size].min if jobs.size.positive?
-
-      results =
-        if worker_count > 1
-          run_daemon_parallel(jobs, worker_count, config, abs_tests, coverage_map, source_map)
-        else
-          run_daemon_serial(jobs, config, abs_tests, coverage_map, source_map)
-        end
-
-      [AggregateResult.new(results + ignored_results), source_map]
-    end
-
-    # Build the coverage map via a short-lived daemon (boots the app once, captures
-    # per-test coverage app-side, ships the map back). Returns a query-only
-    # CoverageMap, or nil when the build fails / returns empty — callers then run the
-    # full --test set. Coverage-build IPC has no wall-clock (same limitation as
-    # in-process build_via_fork). A normal nonempty map scores like in-process;
-    # nil falls back to the full suite (more testing, not comparable).
-    #
-    # @param config [Mutineer::Config] the run config.
-    # @param abs_tests [Array<String>] absolute --test paths.
-    # @return [Mutineer::CoverageMap, nil]
-    def self.daemon_coverage_map(config, abs_tests)
-      client = DaemonClient.new(boot: daemon_boot_config(config, abs_tests, coverage: true),
-                                app_root: config.project_root).start
-      data = begin
-        client.coverage
-      ensure
-        client.quit
-      end
-      unless data && !(data["map"] || {}).empty?
-        reason = data.is_a?(Hash) && data["error"] ? data["error"] : "empty map"
-        warn_daemon_coverage_fallback(reason)
-        return nil
-      end
-
-      CoverageMap.from_data(map: data["map"], failed_test_files: data["failed_test_files"] || [],
-                            project_root: config.project_root)
-    rescue DaemonBootError => e
-      warn_daemon_coverage_fallback("#{e.class}: #{e.message}")
-      nil
-    end
-
-    # Stderr note when daemon coverage is unavailable (full --test set per mutant).
-    #
-    # @api private
-    # @param reason [String] short cause (boot error message, empty map, …).
-    # @return [void]
-    def self.warn_daemon_coverage_fallback(reason = "unknown")
-      warn "[mutineer] daemon coverage map unavailable (#{reason}); running every " \
-           "mutant against the full --test set (score not comparable to an in-process run)."
-    end
-    private_class_method :warn_daemon_coverage_fallback
-
-    # Serial daemon path: one daemon (worker 0), one mutant at a time. Honors
-    # --fail-fast (#21: stop at the first survivor).
-    #
-    # @return [Array<Mutineer::Result>] results in input order.
-    def self.run_daemon_serial(jobs, config, abs_tests, coverage_map, source_map)
-      client = DaemonClient.new(boot: daemon_boot_config(config, abs_tests),
-                                app_root: config.project_root).start
-      results = []
-      begin
-        jobs.each_with_index do |job, i|
-          r = daemon_job_result(job, i, client, 0, config, coverage_map, abs_tests, source_map)
-          results << r
-          break if config.fail_fast && r.survived?
-        end
-      ensure
-        client.quit
-      end
-      results
-    end
-
-    # Parallel daemon path: N daemon handles, each pinned to its own worker slot
-    # (own DB). A shared queue of job indices feeds N tool-side threads; results
-    # are placed by input index so the verdict set matches serial. Callers must
-    # not pass fail_fast here (execute_daemon forces serial for fail-fast).
-    #
-    # @return [Array<Mutineer::Result>] completed results in input order.
-    def self.run_daemon_parallel(jobs, worker_count, config, abs_tests, coverage_map, source_map)
-      results = Array.new(jobs.size)
-      queue   = Queue.new
-      jobs.each_index { |i| queue << i }
-
-      clients = Array.new(worker_count) do
-        DaemonClient.new(boot: daemon_boot_config(config, abs_tests),
-                         app_root: config.project_root).start
-      end
-
-      clients.each_with_index.map do |client, worker|
-        Thread.new do
-          loop do
-            i = begin
-              queue.pop(true)
-            rescue ThreadError
-              break
-            end
-            results[i] = daemon_job_result(jobs[i], i, client, worker, config, coverage_map, abs_tests, source_map)
-          end
-        ensure
-          client.quit
-        end
-      end.each(&:join)
-
-      results.compact
-    end
-
-    # Build the payload for one job, run it on the given daemon/worker, and attach
-    # the subject/mutation/id — the shared body of both daemon paths.
-    #
-    # @param job [Array(Mutineer::Subject, Mutineer::Mutation, String)] the work item.
-    # @param req_id [Integer] request id (echoed back for IPC ordering safety).
-    # @param client [Mutineer::DaemonClient] the daemon handle to run on.
-    # @param worker [Integer] the worker slot (→ worker DB) this daemon routes to.
-    # @return [Mutineer::Result] the decorated result.
-    def self.daemon_job_result(job, req_id, client, worker, config, coverage_map, abs_tests, source_map)
-      subject, mutation, id = job
-      source  = source_map[subject.file]
-      mutated = mutation.apply(source)
-      # KTD-8 (carried): skip an invalid mutant tool-side — never ship a payload that
-      # would fail to load and read as a false `killed`.
-      # #26/U7: narrow to covering tests (shared with the in-process path via
-      # coverage_selection, so scores match). :verdict = no_coverage/uncapturable, no
-      # fork. No map (build failed) → run the full --test set (fallback, not narrowed).
-      sel = coverage_map && coverage_selection(subject.file, mutation, subject, source, coverage_map)
-      r =
-        if Parser.parse_string(mutated).errors.any?
-          Result.skipped
-        elsif sel && sel[0] == :verdict
-          sel[1]
-        else
-          verdict = client.request(
-            id: req_id, worker: worker, timeout: config.daemon_timeout || DAEMON_TIMEOUT,
-            payload: { "code" => mutated, "source_file" => File.expand_path(subject.file, config.project_root) },
-            tests: sel ? sel[1] : abs_tests
-          )
-          daemon_result(verdict)
-        end
-      r.with(subject: subject, mutation: mutation, id: id)
-    end
-
     # Coverage-based test selection, shared by the in-process ({run}) and daemon
-    # paths so both narrow identically (score parity, U7/V5). Returns
+    # paths so both narrow identically (score parity). Returns
     # `[:run, abs_test_paths]` when some test covers the mutant's line, or
     # `[:verdict, Result]` (no_coverage / uncapturable) when none do.
     #
-    # #9/#25: an empty selection is `:uncapturable` (not `:no_coverage`) when the
-    # mutant's enclosing method body got coverage from no *successful* capture but a
-    # sibling test failed to capture — the coverage was lost, not absent. Both are
-    # excluded from the score denominator, so this distinction is reporting-only and
-    # never changes the daemon-vs-in-process score.
+    # An empty selection is `:uncapturable` (not `:no_coverage`) when the
+    # mutant's enclosing method body got coverage from no *successful* capture but
+    # a sibling test failed to capture: the coverage was lost, not absent. Both are
+    # excluded from the score denominator, so this distinction is reporting-only
+    # and never changes the daemon-vs-in-process score.
     #
     # @param source_file [String] the mutated source file path.
     # @param mutation [Mutineer::Mutation] the mutation (for its line offset).
@@ -429,59 +265,6 @@ module Mutineer
       end
 
       [:run, chosen.map { |t| File.expand_path(t, coverage_map.project_root) }]
-    end
-
-    # Default per-mutant timeout on the daemon path (seconds). Coverage narrowing
-    # usually keeps each job short; this still covers a slow suite or full-suite
-    # fallback when the coverage map is unavailable.
-    DAEMON_TIMEOUT = 60
-
-    # The boot config the daemon needs to boot the app once: where to boot, the test
-    # load roots (so `require "test_helper"` resolves in every fork), framework, and
-    # whether this is Rails.
-    def self.daemon_boot_config(config, abs_tests, coverage: false)
-      {
-        project_root: config.project_root,
-        boot: File.expand_path(config.boot || "config/environment", config.project_root),
-        load_paths: test_load_roots(abs_tests),
-        source_dirs: source_dirs(config), # so the daemon can sweep orphan mutant temps
-        framework: config.framework,
-        rails: config.rails,
-        # #26/U5: schema for per-worker DB isolation. Sent when present; the daemon
-        # skips worker-DB schema loading if the path is absent (e.g. structure.sql apps).
-        schema: daemon_schema_path(config),
-        # #26/U7: coverage narrowing. Only the short-lived map-building daemon starts
-        # Coverage (before boot); worker daemons boot with it OFF (no wasted
-        # instrumentation/memory across every mutant fork). `sources`/`tests` are the
-        # map-build inputs.
-        coverage: coverage,
-        sources: config.sources.map { |s| File.expand_path(s, config.project_root) },
-        tests: abs_tests
-      }
-    end
-
-    # Absolute path to the app's `db/schema.rb` if it exists, else nil. Used by the
-    # daemon to schema-load each fork's isolated worker database (#26/U5). Only
-    # `schema.rb` is supported this pass; `structure.sql` apps get nil and fall back to
-    # whatever the worker DB already holds (Postgres provisioning is U10).
-    #
-    # @param config [Mutineer::Config] the run config.
-    # @return [String, nil] absolute schema path or nil.
-    def self.daemon_schema_path(config)
-      path = File.expand_path("db/schema.rb", config.project_root)
-      File.exist?(path) ? path : nil
-    end
-
-    # Map a daemon verdict string to a Result. The daemon reports the four run-time
-    # states it can decide (KTD-5); pre-fork states (skipped/no_coverage/…) are
-    # resolved tool-side before a request is ever sent.
-    def self.daemon_result(verdict)
-      case verdict
-      when "survived" then Result.survived
-      when "killed"   then Result.killed
-      when "timeout"  then Result.timeout
-      else Result.error("daemon verdict: #{verdict}")
-      end
     end
 
     # Scan a source once into { line_number => :all | Set[operator_syms] } from
@@ -550,9 +333,9 @@ module Mutineer
       end.uniq
     end
 
-    # #7: when --rails is on and RAILS_ENV is unset, default it to "test" (and
-    # say so) before the app boots — otherwise it boots development and nothing
-    # is measured. An explicitly-set RAILS_ENV is always respected.
+    # When --rails is on and RAILS_ENV is unset, default it to "test" (and say so)
+    # before the app boots. Otherwise it boots development and nothing is measured.
+    # An explicitly-set RAILS_ENV is always respected.
     def self.ensure_rails_env(config)
       return unless config.rails
       return unless ENV["RAILS_ENV"].nil? || ENV["RAILS_ENV"].empty?
@@ -561,25 +344,27 @@ module Mutineer
       warn "[mutineer] RAILS_ENV was unset; defaulting to 'test' for --rails."
     end
 
-    # The unique absolute directories holding the sources — the sweep target for
-    # both orphan mechanisms (in-process mutant tempfiles and external backup
-    # files). Shared so the path-expansion rule can't drift between the two paths.
+    # The unique absolute directories holding the sources. Sweep target for both
+    # orphan mechanisms (in-process mutant tempfiles and external backup files),
+    # and shipped to the daemon via {DaemonBackend.boot_config} so it can sweep too.
+    # Shared so the path-expansion rule cannot drift between the paths.
     #
-    # @api private
     # @param config [Mutineer::Config] run configuration.
     # @return [Array<String>] unique absolute source directories.
     def self.source_dirs(config)
       config.sources.map { |f| File.dirname(File.expand_path(f, config.project_root)) }.uniq
     end
 
-    # Removes stale mutant tempfiles from the given directories.
+    # Removes stale mutant tempfiles from the given directories. The daemon writes a
+    # differently-named temp, so {DaemonBackend} passes its glob when it has to sweep
+    # tool-side (nothing boots on an empty run, so the daemon's own sweep never runs).
     #
-    # @api private
     # @param dirs [Array<String>] directories to sweep.
+    # @param glob [String] filename pattern to remove.
     # @return [void]
-    def self.sweep_orphans(dirs)
+    def self.sweep_orphans(dirs, glob = "mutineer_mutant*.rb")
       dirs.each do |dir|
-        Dir.glob(File.join(dir, "mutineer_mutant*.rb")).each do |f|
+        Dir.glob(File.join(dir, glob)).each do |f|
           File.unlink(f) rescue nil # rubocop:disable Style/RescueModifier
         end
       end
@@ -601,13 +386,13 @@ module Mutineer
       source  = File.read(source_file)
       mutated = mutation.apply(source)
 
-      # Validity rule: a mutant that doesn't re-parse is skipped before forking.
+      # Validity rule: a mutant that does not re-parse is skipped before forking.
       return Result.skipped if Parser.parse_string(mutated).errors.any?
 
       # Coverage selection (both standalone and boot mode): a mutation on a line
       # no test exercises is :no_coverage (no fork); otherwise exactly the
       # covering test files run in the child. Shared with the daemon path so both
-      # narrow identically (score parity, U7/V5).
+      # narrow identically (score parity).
       kind, payload = coverage_selection(source_file, mutation, subject, source, coverage_map)
       return payload if kind == :verdict
 
@@ -634,9 +419,9 @@ module Mutineer
       return unless defined?(ActiveRecord::Base)
 
       base = ActiveRecord::Base
-      # #8: clearing connections here drops an open transactional-fixture
+      # Clearing connections here drops an open transactional-fixture
       # transaction, so the test loses its fixture rows and fails. Skip the clear
-      # when a transaction is open; otherwise clear (v0.2 per-fork write-safety).
+      # when a transaction is open; otherwise clear (per-fork write-safety).
       return if fixture_transaction_open?(base)
 
       base.connection_handler.clear_all_connections!
@@ -646,9 +431,9 @@ module Mutineer
     private_class_method :reconnect_active_record
 
     # Pure, injectable predicate: true when a transactional-fixture transaction is
-    # already open on the connection. Keys off open_transactions (KTD-2) so it is
-    # correct whenever the transaction exists, regardless of when it opened. Any
-    # probe error degrades safe to false -> caller clears (existing behaviour).
+    # already open on the connection. Keys off open_transactions so it is correct
+    # whenever the transaction exists, regardless of when it opened. Any probe
+    # error degrades safe to false -> caller clears (existing behaviour).
     def self.fixture_transaction_open?(base)
       pool = base.connection_pool
       pool.active_connection? && base.connection.open_transactions.positive?
